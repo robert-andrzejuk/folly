@@ -18,6 +18,7 @@
 
 #if FOLLY_HAVE_LIBLZ4
 #include <lz4.h>
+#include <lz4frame.h>
 #include <lz4hc.h>
 #endif
 
@@ -303,12 +304,11 @@ uint64_t LZ4Codec::doMaxUncompressedLength() const {
 }
 
 std::unique_ptr<IOBuf> LZ4Codec::doCompress(const IOBuf* data) {
-  std::unique_ptr<IOBuf> clone;
+  IOBuf clone;
   if (data->isChained()) {
     // LZ4 doesn't support streaming, so we have to coalesce
-    clone = data->clone();
-    clone->coalesce();
-    data = clone.get();
+    clone = data->cloneCoalescedAsValue();
+    data = &clone;
   }
 
   uint32_t extraSize = encodeSize() ? kMaxVarintLength64 : 0;
@@ -345,12 +345,11 @@ std::unique_ptr<IOBuf> LZ4Codec::doCompress(const IOBuf* data) {
 std::unique_ptr<IOBuf> LZ4Codec::doUncompress(
     const IOBuf* data,
     uint64_t uncompressedLength) {
-  std::unique_ptr<IOBuf> clone;
+  IOBuf clone;
   if (data->isChained()) {
     // LZ4 doesn't support streaming, so we have to coalesce
-    clone = data->clone();
-    clone->coalesce();
-    data = clone.get();
+    clone = data->cloneCoalescedAsValue();
+    data = &clone;
   }
 
   folly::io::Cursor cursor(data);
@@ -385,7 +384,160 @@ std::unique_ptr<IOBuf> LZ4Codec::doUncompress(
   return out;
 }
 
-#endif  // FOLLY_HAVE_LIBLZ4
+class LZ4FrameCodec final : public Codec {
+ public:
+  static std::unique_ptr<Codec> create(int level, CodecType type);
+  explicit LZ4FrameCodec(int level, CodecType type);
+  ~LZ4FrameCodec();
+
+ private:
+  std::unique_ptr<IOBuf> doCompress(const IOBuf* data) override;
+  std::unique_ptr<IOBuf> doUncompress(
+      const IOBuf* data,
+      uint64_t uncompressedLength) override;
+
+  // Reset the dctx_ if it is dirty or null.
+  void resetDCtx();
+
+  int level_;
+  LZ4F_dctx* dctx_{nullptr};
+  bool dirty_{false};
+};
+
+/* static */ std::unique_ptr<Codec> LZ4FrameCodec::create(
+    int level,
+    CodecType type) {
+  return make_unique<LZ4FrameCodec>(level, type);
+}
+
+static size_t lz4FrameThrowOnError(size_t code) {
+  if (LZ4F_isError(code)) {
+    throw std::runtime_error(
+        to<std::string>("LZ4Frame error: ", LZ4F_getErrorName(code)));
+  }
+  return code;
+}
+
+void LZ4FrameCodec::resetDCtx() {
+  if (dctx_ && !dirty_) {
+    return;
+  }
+  if (dctx_) {
+    LZ4F_freeDecompressionContext(dctx_);
+  }
+  lz4FrameThrowOnError(LZ4F_createDecompressionContext(&dctx_, 100));
+  dirty_ = false;
+}
+
+LZ4FrameCodec::LZ4FrameCodec(int level, CodecType type) : Codec(type) {
+  DCHECK(type == CodecType::LZ4_FRAME);
+  switch (level) {
+    case COMPRESSION_LEVEL_FASTEST:
+    case COMPRESSION_LEVEL_DEFAULT:
+      level_ = 0;
+      break;
+    case COMPRESSION_LEVEL_BEST:
+      level_ = 16;
+      break;
+    default:
+      level_ = level;
+      break;
+  }
+}
+
+LZ4FrameCodec::~LZ4FrameCodec() {
+  if (dctx_) {
+    LZ4F_freeDecompressionContext(dctx_);
+  }
+}
+
+std::unique_ptr<IOBuf> LZ4FrameCodec::doCompress(const IOBuf* data) {
+  // LZ4 Frame compression doesn't support streaming so we have to coalesce
+  IOBuf clone;
+  if (data->isChained()) {
+    clone = data->cloneCoalescedAsValue();
+    data = &clone;
+  }
+  // Set preferences
+  const auto uncompressedLength = data->length();
+  LZ4F_preferences_t prefs{};
+  prefs.compressionLevel = level_;
+  prefs.frameInfo.contentSize = uncompressedLength;
+  // Compress
+  auto buf = IOBuf::create(LZ4F_compressFrameBound(uncompressedLength, &prefs));
+  const size_t written = lz4FrameThrowOnError(LZ4F_compressFrame(
+      buf->writableTail(),
+      buf->tailroom(),
+      data->data(),
+      data->length(),
+      &prefs));
+  buf->append(written);
+  return buf;
+}
+
+std::unique_ptr<IOBuf> LZ4FrameCodec::doUncompress(
+    const IOBuf* data,
+    uint64_t uncompressedLength) {
+  // Reset the dctx if any errors have occurred
+  resetDCtx();
+  // Coalesce the data
+  ByteRange in = *data->begin();
+  IOBuf clone;
+  if (data->isChained()) {
+    clone = data->cloneCoalescedAsValue();
+    in = clone.coalesce();
+  }
+  data = nullptr;
+  // Select decompression options
+  LZ4F_decompressOptions_t options;
+  options.stableDst = 1;
+  // Select blockSize and growthSize for the IOBufQueue
+  IOBufQueue queue(IOBufQueue::cacheChainLength());
+  auto blockSize = uint64_t{64} << 10;
+  auto growthSize = uint64_t{4} << 20;
+  if (uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH) {
+    // Allocate uncompressedLength in one chunk (up to 64 MB)
+    const auto allocateSize = std::min(uncompressedLength, uint64_t{64} << 20);
+    queue.preallocate(allocateSize, allocateSize);
+    blockSize = std::min(uncompressedLength, blockSize);
+    growthSize = std::min(uncompressedLength, growthSize);
+  } else {
+    // Reduce growthSize for small data
+    const auto guessUncompressedLen = 4 * std::max(blockSize, in.size());
+    growthSize = std::min(guessUncompressedLen, growthSize);
+  }
+  // Once LZ4_decompress() is called, the dctx_ cannot be reused until it
+  // returns 0
+  dirty_ = true;
+  // Decompress until the frame is over
+  size_t code = 0;
+  do {
+    // Allocate enough space to decompress at least a block
+    void* out;
+    size_t outSize;
+    std::tie(out, outSize) = queue.preallocate(blockSize, growthSize);
+    // Decompress
+    size_t inSize = in.size();
+    code = lz4FrameThrowOnError(
+        LZ4F_decompress(dctx_, out, &outSize, in.data(), &inSize, &options));
+    if (in.empty() && outSize == 0 && code != 0) {
+      // We passed no input, no output was produced, and the frame isn't over
+      // No more forward progress is possible
+      throw std::runtime_error("LZ4Frame error: Incomplete frame");
+    }
+    in.uncheckedAdvance(inSize);
+    queue.postallocate(outSize);
+  } while (code != 0);
+  // At this point the decompression context can be reused
+  dirty_ = false;
+  if (uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH &&
+      queue.chainLength() != uncompressedLength) {
+    throw std::runtime_error("LZ4Frame error: Invalid uncompressedLength");
+  }
+  return queue.move();
+}
+
+#endif // FOLLY_HAVE_LIBLZ4
 
 #if FOLLY_HAVE_LIBSNAPPY
 
@@ -821,7 +973,7 @@ LZMA2Codec::LZMA2Codec(int level, CodecType type) : Codec(type) {
 }
 
 bool LZMA2Codec::doNeedsUncompressedLength() const {
-  return !encodeSize();
+  return false;
 }
 
 uint64_t LZMA2Codec::doMaxUncompressedLength() const {
@@ -952,27 +1104,25 @@ std::unique_ptr<IOBuf> LZMA2Codec::doUncompress(const IOBuf* data,
   SCOPE_EXIT { lzma_end(&stream); };
 
   // Max 64MiB in one go
-  constexpr uint32_t maxSingleStepLength = uint32_t(64) << 20;    // 64MiB
-  constexpr uint32_t defaultBufferLength = uint32_t(4) << 20;     // 4MiB
+  constexpr uint32_t maxSingleStepLength = uint32_t(64) << 20; // 64MiB
+  constexpr uint32_t defaultBufferLength = uint32_t(256) << 10; // 256 KiB
 
   folly::io::Cursor cursor(data);
-  uint64_t actualUncompressedLength;
   if (encodeSize()) {
-    actualUncompressedLength = decodeVarintFromCursor(cursor);
+    const uint64_t actualUncompressedLength = decodeVarintFromCursor(cursor);
     if (uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH &&
         uncompressedLength != actualUncompressedLength) {
       throw std::runtime_error("LZMA2Codec: invalid uncompressed length");
     }
-  } else {
-    actualUncompressedLength = uncompressedLength;
-    DCHECK_NE(actualUncompressedLength, UNKNOWN_UNCOMPRESSED_LENGTH);
+    uncompressedLength = actualUncompressedLength;
   }
 
   auto out = addOutputBuffer(
       &stream,
-      (actualUncompressedLength <= maxSingleStepLength ?
-       actualUncompressedLength :
-       defaultBufferLength));
+      ((uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH &&
+        uncompressedLength <= maxSingleStepLength)
+           ? uncompressedLength
+           : defaultBufferLength));
 
   bool streamEnd = false;
   auto buf = cursor.peekBytes();
@@ -999,9 +1149,10 @@ std::unique_ptr<IOBuf> LZMA2Codec::doUncompress(const IOBuf* data,
 
   out->prev()->trimEnd(stream.avail_out);
 
-  if (actualUncompressedLength != stream.total_out) {
-    throw std::runtime_error(to<std::string>(
-        "LZMA2Codec: invalid uncompressed length"));
+  if (uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH &&
+      uncompressedLength != stream.total_out) {
+    throw std::runtime_error(
+        to<std::string>("LZMA2Codec: invalid uncompressed length"));
   }
 
   return out;
@@ -1118,7 +1269,28 @@ std::unique_ptr<IOBuf> ZSTDCodec::doCompress(const IOBuf* data) {
   return result;
 }
 
-std::unique_ptr<IOBuf> ZSTDCodec::doUncompress(
+static std::unique_ptr<IOBuf> zstdUncompressBuffer(
+    const IOBuf* data,
+    uint64_t uncompressedLength) {
+  // Check preconditions
+  DCHECK(!data->isChained());
+  DCHECK(uncompressedLength != Codec::UNKNOWN_UNCOMPRESSED_LENGTH);
+
+  auto uncompressed = IOBuf::create(uncompressedLength);
+  const auto decompressedSize = ZSTD_decompress(
+      uncompressed->writableTail(),
+      uncompressed->tailroom(),
+      data->data(),
+      data->length());
+  zstdThrowIfError(decompressedSize);
+  if (decompressedSize != uncompressedLength) {
+    throw std::runtime_error("ZSTD: invalid uncompressed length");
+  }
+  uncompressed->append(decompressedSize);
+  return uncompressed;
+}
+
+static std::unique_ptr<IOBuf> zstdUncompressStream(
     const IOBuf* data,
     uint64_t uncompressedLength) {
   auto zds = ZSTD_createDStream();
@@ -1133,14 +1305,8 @@ std::unique_ptr<IOBuf> ZSTDCodec::doUncompress(
   ZSTD_inBuffer in{};
 
   auto outputSize = ZSTD_DStreamOutSize();
-  if (uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH) {
+  if (uncompressedLength != Codec::UNKNOWN_UNCOMPRESSED_LENGTH) {
     outputSize = uncompressedLength;
-  } else {
-    auto decompressedSize =
-        ZSTD_getDecompressedSize(data->data(), data->length());
-    if (decompressedSize != 0 && decompressedSize < outputSize) {
-      outputSize = decompressedSize;
-    }
   }
 
   IOBufQueue queue(IOBufQueue::cacheChainLength());
@@ -1179,7 +1345,7 @@ std::unique_ptr<IOBuf> ZSTDCodec::doUncompress(
   if (in.pos != in.size || !cursor.isAtEnd()) {
     throw std::runtime_error("ZSTD: junk after end of data");
   }
-  if (uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH &&
+  if (uncompressedLength != Codec::UNKNOWN_UNCOMPRESSED_LENGTH &&
       queue.chainLength() != uncompressedLength) {
     throw std::runtime_error("ZSTD: invalid uncompressed length");
   }
@@ -1187,12 +1353,35 @@ std::unique_ptr<IOBuf> ZSTDCodec::doUncompress(
   return queue.move();
 }
 
+std::unique_ptr<IOBuf> ZSTDCodec::doUncompress(
+    const IOBuf* data,
+    uint64_t uncompressedLength) {
+  {
+    // Read decompressed size from frame if available in first IOBuf.
+    const auto decompressedSize =
+        ZSTD_getDecompressedSize(data->data(), data->length());
+    if (decompressedSize != 0) {
+      if (uncompressedLength != Codec::UNKNOWN_UNCOMPRESSED_LENGTH &&
+          uncompressedLength != decompressedSize) {
+        throw std::runtime_error("ZSTD: invalid uncompressed length");
+      }
+      uncompressedLength = decompressedSize;
+    }
+  }
+  // Faster to decompress using ZSTD_decompress() if we can.
+  if (uncompressedLength != UNKNOWN_UNCOMPRESSED_LENGTH && !data->isChained()) {
+    return zstdUncompressBuffer(data, uncompressedLength);
+  }
+  // Fall back to slower streaming decompression.
+  return zstdUncompressStream(data, uncompressedLength);
+}
+
 #endif  // FOLLY_HAVE_LIBZSTD
 
 }  // namespace
 
 typedef std::unique_ptr<Codec> (*CodecFactory)(int, CodecType);
-static CodecFactory
+static constexpr CodecFactory
     codecFactories[static_cast<size_t>(CodecType::NUM_CODEC_TYPES)] = {
         nullptr, // USER_DEFINED
         NoCompressionCodec::create,
@@ -1237,6 +1426,12 @@ static CodecFactory
 
 #if FOLLY_HAVE_LIBZ
         ZlibCodec::create,
+#else
+        nullptr,
+#endif
+
+#if FOLLY_HAVE_LIBLZ4
+        LZ4FrameCodec::create,
 #else
         nullptr,
 #endif

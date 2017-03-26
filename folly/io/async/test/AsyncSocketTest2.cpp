@@ -3085,41 +3085,29 @@ TEST(AsyncSocketTest, SendMessageFlags) {
 }
 
 TEST(AsyncSocketTest, SendMessageAncillaryData) {
-  struct sockaddr_un addr = {AF_UNIX,
-                             "AsyncSocketTest.SendMessageAncillaryData\0"};
+  int fds[2];
+  EXPECT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 
-  // Clean up the name in the name space we're going to use
-  ASSERT_FALSE(remove(addr.sun_path) == -1 && errno != ENOENT);
+  // "Client" socket
+  int cfd = fds[0];
+  ASSERT_NE(cfd, -1);
 
-  // Set up listening socket
-  int lfd = fsp::socket(AF_UNIX, SOCK_STREAM, 0);
-  ASSERT_NE(lfd, -1);
-  ASSERT_NE(bind(lfd, (struct sockaddr*)&addr, sizeof(addr)), -1)
-      << "Bind failed: " << errno;
-
-  // Create the connecting socket
-  int csd = fsp::socket(AF_UNIX, SOCK_STREAM, 0);
-  ASSERT_NE(csd, -1);
-
-  // Listen for incoming connect
-  ASSERT_NE(listen(lfd, 5), -1);
-
-  // Connect to the listening socket
-  ASSERT_NE(fsp::connect(csd, (struct sockaddr*)&addr, sizeof(addr)), -1)
-      << "Connect request failed: " << errno;
-
-  // Accept the connection
-  int sfd = accept(lfd, nullptr, nullptr);
+  // "Server" socket
+  int sfd = fds[1];
   ASSERT_NE(sfd, -1);
+  SCOPE_EXIT { close(sfd); };
 
   // Instantiate AsyncSocket object for the connected socket
   EventBase evb;
-  std::shared_ptr<AsyncSocket> socket = AsyncSocket::newSocket(&evb, csd);
+  std::shared_ptr<AsyncSocket> socket = AsyncSocket::newSocket(&evb, cfd);
 
   // Open a temporary file and write a magic string to it
   // We'll transfer the file handle to test the message parameters
   // callback logic.
-  int tmpfd = open("/var/tmp", O_RDWR | O_TMPFILE);
+  TemporaryFile file(StringPiece(),
+                     fs::path(),
+                     TemporaryFile::Scope::UNLINK_IMMEDIATELY);
+  int tmpfd = file.fd();
   ASSERT_NE(tmpfd, -1) << "Failed to open a temporary file";
   std::string magicString("Magic string");
   ASSERT_EQ(write(tmpfd, magicString.c_str(), magicString.length()),
@@ -3178,6 +3166,7 @@ TEST(AsyncSocketTest, SendMessageAncillaryData) {
   int fd = 0;
   memcpy(&fd, CMSG_DATA(&r_u.cmh), sizeof(int));
   ASSERT_NE(fd, 0);
+  SCOPE_EXIT { close(fd); };
 
   std::vector<uint8_t> transferredMagicString(magicString.length() + 1, 0);
 
